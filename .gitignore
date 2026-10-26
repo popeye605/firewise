@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+*.log
+.streamlit/secrets.toml
+.DS_Store
+.idea/
+.vscode/
+
+# real data, never commit
+data/private/
+*.real.conf
