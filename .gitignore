@@ -8,6 +8,9 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+.pytest_cache/
+*.egg-info/
+reports/
 
 # real data, never commit
 data/private/
