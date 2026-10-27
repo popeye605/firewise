@@ -128,3 +128,25 @@ def test_report_includes_escaped_data_warnings_and_removed_deny_warning() -> Non
     assert "<h2>Data warnings</h2>" in report
     assert "CSV line 7: &lt;untrusted&gt; warning" in report
     assert "These deny rules were removed; their logging is lost: R031" in report
+
+
+def test_report_includes_active_zone_trust() -> None:
+    from core.checks import ZoneTrust
+    from tests.helpers import make_rule
+
+    rules = [make_rule("custom")]
+    trust = ZoneTrust(
+        untrusted=frozenset({"outside"}),
+        trusted=frozenset({"core"}),
+    )
+    report = generate_html_report(
+        source_name="Custom",
+        rules=rules,
+        findings=analyze_rules(rules, trust),
+        health_score=calculate_health_score(rules, analyze_rules(rules, trust)),
+        zone_trust=trust,
+    )
+
+    assert "<h2>Zone trust</h2>" in report
+    assert "outside" in report
+    assert "core" in report

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 from io import StringIO
+from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -20,8 +22,21 @@ from ai.astar import (
     build_zone_graph,
 )
 from ai.genetic import OptimizationResult, optimize_rules
-from core.checks import Finding, ProblemType, Severity, analyze_rules
-from core.loader import RuleLoadError, load_demo_rules, load_rules_with_warnings
+from core.checks import (
+    DEFAULT_ZONE_TRUST,
+    Finding,
+    ProblemType,
+    Severity,
+    ZoneTrust,
+    analyze_rules,
+    parse_zone_trust_json,
+)
+from core.loader import (
+    MAX_FILE_BYTES,
+    RuleLoadError,
+    load_demo_rules,
+    load_rules_with_warnings,
+)
 from core.models import Rule
 from core.score import calculate_health_score
 from reports.html_report import generate_html_report
@@ -51,6 +66,27 @@ def _set_rules(
     st.session_state["source_name"] = source_name
     st.session_state["load_error"] = None
     st.session_state["data_warnings"] = data_warnings or []
+    _invalidate_results()
+
+
+def _update_zone_trust_from_widgets() -> None:
+    """Apply the current zone trust selector values to session policy."""
+    zones: list[str] = st.session_state.get("zone_trust_zones", [])
+    current: ZoneTrust = st.session_state["zone_trust"]
+    zone_keys = {zone.casefold() for zone in zones}
+    untrusted = set(current.untrusted) - zone_keys
+    trusted = set(current.trusted) - zone_keys
+    for zone in zones:
+        key = f"zone_trust_{zone.casefold()}"
+        selection = st.session_state.get(key, "Neutral")
+        if selection == "Untrusted":
+            untrusted.add(zone.casefold())
+        elif selection == "Trusted":
+            trusted.add(zone.casefold())
+    st.session_state["zone_trust"] = ZoneTrust(
+        untrusted=frozenset(untrusted),
+        trusted=frozenset(trusted),
+    )
     _invalidate_results()
 
 
@@ -93,9 +129,14 @@ def _render_zone_graph(
     rules: list[Rule],
     path_result: PathSearchResult | None,
     respect_order: bool = True,
+    zone_trust: ZoneTrust | None = None,
 ) -> None:
     """Display the directed permit graph and highlight any selected route."""
-    graph = build_zone_graph(rules, respect_order=respect_order)
+    graph = build_zone_graph(
+        rules,
+        respect_order=respect_order,
+        zone_trust=zone_trust,
+    )
     if graph.number_of_nodes() == 0:
         st.info("There are no permit rules to show as zone transitions.")
         return
@@ -142,6 +183,31 @@ def _render_home() -> None:
     left, right = st.columns(2)
     with left:
         st.markdown("#### Start with sample data")
+        selected_sample = st.selectbox(
+            "Load sample",
+            ("demo_rules", "astar_demo", "stress_rules"),
+            format_func=lambda value: {
+                "demo_rules": "Demo rules",
+                "astar_demo": "A* vs BFS example",
+                "stress_rules": "Optimizer stress example",
+            }[value],
+            key="sample_choice",
+        )
+        if st.button("Load selected sample", type="primary", width="stretch"):
+            try:
+                if selected_sample == "demo_rules":
+                    _set_rules(load_demo_rules(), "Bundled demo data")
+                else:
+                    sample_path = (
+                        Path(__file__).resolve().parent
+                        / "data"
+                        / f"{selected_sample}.csv"
+                    )
+                    sample_rules, warnings = load_rules_with_warnings(sample_path)
+                    _set_rules(sample_rules, sample_path.name, warnings)
+                st.rerun()
+            except RuleLoadError as exc:
+                st.error(f"Could not load sample: {exc}")
         if st.button("Load Demo Data", type="primary", width="stretch"):
             try:
                 _set_rules(load_demo_rules(), "Bundled demo data")
@@ -168,6 +234,11 @@ def _render_home() -> None:
             )
             if st.session_state.get("upload_signature") != upload_signature:
                 try:
+                    if len(content) > MAX_FILE_BYTES:
+                        raise RuleLoadError(
+                            f"CSV exceeds the maximum file size of "
+                            f"{MAX_FILE_BYTES:,} bytes."
+                        )
                     text = content.decode("utf-8-sig")
                     parsed_rules, warnings = load_rules_with_warnings(StringIO(text))
                     _set_rules(parsed_rules, uploaded_file.name, warnings)
@@ -188,6 +259,75 @@ def _render_home() -> None:
             with st.expander("Data warnings"):
                 for warning in st.session_state["data_warnings"]:
                     st.warning(warning)
+        with st.expander("Zone trust"):
+            trust_upload = st.file_uploader(
+                "Upload zone trust JSON",
+                type=["json"],
+                key="zone_trust_upload",
+            )
+            if trust_upload is not None:
+                trust_bytes = trust_upload.getvalue()
+                signature = hashlib.sha256(trust_bytes).hexdigest()
+                if signature != st.session_state.get("zone_trust_upload_signature"):
+                    try:
+                        if len(trust_bytes) > MAX_FILE_BYTES:
+                            raise ValueError(
+                                f"Zone trust file exceeds {MAX_FILE_BYTES:,} bytes."
+                            )
+                        uploaded_trust = parse_zone_trust_json(
+                            trust_bytes.decode("utf-8-sig")
+                        )
+                    except (UnicodeDecodeError, ValueError) as exc:
+                        st.error(str(exc))
+                    else:
+                        st.session_state["zone_trust"] = uploaded_trust
+                        st.session_state["zone_trust_upload_signature"] = signature
+                        for zone in st.session_state.get("zone_trust_zones", []):
+                            st.session_state.pop(
+                                f"zone_trust_{zone.casefold()}",
+                                None,
+                            )
+                        _invalidate_results()
+                        st.rerun()
+
+            zones_by_key = {
+                zone.casefold(): zone
+                for rule in st.session_state["rules"]
+                for zone in (rule.src_zone, rule.dst_zone)
+            }
+            zones = sorted(zones_by_key.values(), key=str.casefold)
+            st.session_state["zone_trust_zones"] = zones
+            active_trust: ZoneTrust = st.session_state["zone_trust"]
+            options = ("Untrusted", "Trusted", "Neutral")
+            for zone in zones:
+                normalized = zone.casefold()
+                default = (
+                    "Untrusted"
+                    if normalized in active_trust.untrusted
+                    else "Trusted"
+                    if normalized in active_trust.trusted
+                    else "Neutral"
+                )
+                st.selectbox(
+                    zone,
+                    options,
+                    index=options.index(default),
+                    key=f"zone_trust_{normalized}",
+                    on_change=_update_zone_trust_from_widgets,
+                )
+            trust_json = json.dumps(
+                {
+                    "untrusted": sorted(active_trust.untrusted),
+                    "trusted": sorted(active_trust.trusted),
+                },
+                indent=2,
+            )
+            st.download_button(
+                "Download zone trust JSON",
+                data=trust_json,
+                file_name="firewise_zone_trust.json",
+                mime="application/json",
+            )
     else:
         st.info("Load the demo policy or upload a CSV to begin.")
 
@@ -306,7 +446,10 @@ def _render_problems(findings: list[Finding]) -> None:
                 st.caption("Related rules: " + ", ".join(finding.related_rule_ids))
 
 
-def _render_network_map(rules: list[Rule]) -> None:
+def _render_network_map(
+    rules: list[Rule],
+    zone_trust: ZoneTrust | None = None,
+) -> None:
     """Render zone selection, attack-path comparison, and interactive graph."""
     st.header("Network map and attack path")
     respect_order = st.checkbox(
@@ -314,7 +457,11 @@ def _render_network_map(rules: list[Rule]) -> None:
         value=True,
         key="respect_rule_order",
     )
-    graph = build_zone_graph(rules, respect_order=respect_order)
+    graph = build_zone_graph(
+        rules,
+        respect_order=respect_order,
+        zone_trust=zone_trust,
+    )
     excluded_permits = sum(rule.action.value == "permit" for rule in rules) - graph.number_of_edges()
     st.caption(f"Permit rules left out of the graph: {excluded_permits}")
     zones = sorted(graph.nodes, key=str.casefold)
@@ -323,7 +470,7 @@ def _render_network_map(rules: list[Rule]) -> None:
         return
     if len(zones) == 1:
         st.info("Add permit rules connecting at least two zones to find an attack path.")
-        _render_zone_graph(rules, None, respect_order)
+        _render_zone_graph(rules, None, respect_order, zone_trust)
         return
 
     source_default = zones.index("Internet") if "Internet" in zones else 0
@@ -384,10 +531,13 @@ def _render_network_map(rules: list[Rule]) -> None:
             width="stretch",
             hide_index=True,
         )
-    _render_zone_graph(rules, selected_result, respect_order)
+    _render_zone_graph(rules, selected_result, respect_order, zone_trust)
 
 
-def _render_optimizer(rules: list[Rule]) -> None:
+def _render_optimizer(
+    rules: list[Rule],
+    zone_trust: ZoneTrust | None = None,
+) -> None:
     """Run optimization on request and show review-only results."""
     st.header("Recommendation optimizer")
     st.warning(
@@ -409,6 +559,7 @@ def _render_optimizer(rules: list[Rule]) -> None:
         try:
             result = optimize_rules(
                 rules,
+                zone_trust=zone_trust,
                 keep_logged_rules=keep_logged_rules,
                 keep_deny_rules=keep_deny_rules,
                 progress_callback=lambda progress: progress_bar.progress(
@@ -474,6 +625,13 @@ def _render_optimizer(rules: list[Rule]) -> None:
         f"{result.verification.random_packets_tested:,} random packets · "
         f"{result.verification.mismatch_count} mismatches"
     )
+    if result.packet_count_cap is not None:
+        st.caption(
+            "Large policy detected; packet verification/training capped at "
+            f"{result.packet_count_cap:,} packets, search at "
+            f"{result.search_population_cap} candidates × "
+            f"{result.search_generation_cap} generations."
+        )
     if result.fitness_history:
         fitness_chart = px.line(
             x=list(range(len(result.fitness_history))),
@@ -519,6 +677,7 @@ def _render_report(
     rules: list[Rule],
     findings: list[Finding],
     source_name: str,
+    zone_trust: ZoneTrust | None = None,
 ) -> None:
     """Render a downloadable, self-contained HTML analysis report."""
     st.header("HTML report")
@@ -535,6 +694,7 @@ def _render_report(
             attack_results=st.session_state.get("attack_results"),
             optimization_result=st.session_state.get("optimization_result"),
             data_warnings=st.session_state.get("data_warnings", []),
+            zone_trust=zone_trust,
         )
     except (TypeError, ValueError) as exc:
         st.error(f"Could not generate the HTML report: {exc}")
@@ -568,11 +728,14 @@ def main() -> None:
     st.session_state.setdefault("optimization_result", None)
     st.session_state.setdefault("attack_path", None)
     st.session_state.setdefault("upload_signature", None)
+    st.session_state.setdefault("zone_trust", DEFAULT_ZONE_TRUST)
+    st.session_state.setdefault("zone_trust_upload_signature", None)
     st.session_state.setdefault("load_error", None)
     st.session_state.setdefault("data_warnings", [])
 
     rules: list[Rule] = st.session_state["rules"]
-    findings = analyze_rules(rules) if rules else []
+    zone_trust: ZoneTrust = st.session_state["zone_trust"]
+    findings = analyze_rules(rules, zone_trust) if rules else []
     if st.session_state["load_error"]:
         st.error(st.session_state["load_error"])
     st.sidebar.title("🛡️ FireWise")
@@ -612,12 +775,12 @@ def main() -> None:
             st.info("Load a policy on the Home tab to inspect problems.")
     with network_tab:
         if rules:
-            _render_network_map(rules)
+            _render_network_map(rules, zone_trust)
         else:
             st.info("Load a policy on the Home tab to explore zone paths.")
     with optimizer_tab:
         if rules:
-            _render_optimizer(rules)
+            _render_optimizer(rules, zone_trust)
         else:
             st.info("Load a policy on the Home tab to optimize a recommendation.")
     with report_tab:
@@ -625,6 +788,7 @@ def main() -> None:
             rules,
             findings,
             st.session_state["source_name"] or "Uploaded firewall policy",
+            zone_trust,
         )
 
 

@@ -70,3 +70,18 @@ def test_app_shows_csv_normalization_warnings_on_home() -> None:
 
     assert not app.exception
     assert any("has host bits set; treated as 10.0.0.0/24." in item.value for item in app.warning)
+
+
+def test_zone_trust_controls_are_prefilled_and_update_session_policy() -> None:
+    app_path = Path(__file__).resolve().parents[1] / "app.py"
+    app = AppTest.from_file(str(app_path), default_timeout=30).run()
+    app.button[0].click().run()
+
+    web_choice = next(item for item in app.selectbox if item.key == "zone_trust_web")
+    assert web_choice.value == "Neutral"
+    assert any(item.label == "Download zone trust JSON" for item in app.download_button)
+
+    web_choice.set_value("Trusted").run()
+
+    assert not app.exception
+    assert "web" in app.session_state["zone_trust"].trusted

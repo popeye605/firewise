@@ -12,6 +12,7 @@ from ai.astar import (
     risk_cost,
     rule_is_reachable,
 )
+from core.checks import ZoneTrust
 from core.loader import load_demo_rules
 from core.models import Action
 from tests.helpers import make_rule
@@ -81,7 +82,13 @@ def test_astar_chooses_lower_risk_cost_path_while_bfs_chooses_fewer_hops() -> No
             log=False,
         ),
     ]
-    graph = build_zone_graph(rules)
+    graph = build_zone_graph(
+        rules,
+        zone_trust=ZoneTrust(
+            untrusted=frozenset({"Internet"}),
+            trusted=frozenset({"Web", "Database"}),
+        ),
+    )
 
     astar = astar_search(graph, "Internet", "Database")
     bfs = breadth_first_search(graph, "Internet", "Database")

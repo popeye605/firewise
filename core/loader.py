@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import ipaddress
+from io import StringIO
 from pathlib import Path
 import re
 from typing import TextIO
@@ -20,6 +21,8 @@ REQUIRED_COLUMNS = (
     "action",
     "log",
 )
+MAX_FILE_BYTES = 5_000_000
+MAX_RULES = 5_000
 
 _SERVICE_ALIASES: dict[str, ServiceMatch] = {
     "any": ServiceMatch("any"),
@@ -236,11 +239,33 @@ def load_rules_with_warnings(
     """Load firewall rules and return normalization warnings alongside them."""
     should_close = isinstance(source, (str, Path))
     try:
-        stream = (
-            Path(source).open("r", encoding="utf-8-sig", newline="")
-            if should_close
-            else source
-        )
+        if should_close:
+            path = Path(source)
+            if path.stat().st_size > MAX_FILE_BYTES:
+                raise RuleLoadError(
+                    f"CSV exceeds the maximum file size of {MAX_FILE_BYTES:,} bytes."
+                )
+            content_bytes = path.read_bytes()
+            if len(content_bytes) > MAX_FILE_BYTES:
+                raise RuleLoadError(
+                    f"CSV exceeds the maximum file size of {MAX_FILE_BYTES:,} bytes."
+                )
+            content = content_bytes.decode("utf-8-sig")
+        else:
+            content_parts: list[str] = []
+            total_bytes = 0
+            while True:
+                part = source.read(65_536)
+                if not part:
+                    break
+                total_bytes += len(part.encode("utf-8"))
+                if total_bytes > MAX_FILE_BYTES:
+                    raise RuleLoadError(
+                        f"CSV exceeds the maximum file size of {MAX_FILE_BYTES:,} bytes."
+                    )
+                content_parts.append(part)
+            content = "".join(content_parts)
+        stream = StringIO(content, newline="")
         reader = csv.DictReader(stream)
         if reader.fieldnames is None:
             raise RuleLoadError("CSV input is empty or missing a header.")
@@ -260,6 +285,10 @@ def load_rules_with_warnings(
         for line_number, row in enumerate(reader, start=2):
             if row is None or all(not (value or "").strip() for value in row.values()):
                 continue
+            if len(rules) >= MAX_RULES:
+                raise RuleLoadError(
+                    f"CSV exceeds the maximum of {MAX_RULES:,} firewall rules."
+                )
             rule = _rule_from_row(row, line_number, warnings)
             if rule.id in seen_ids:
                 raise RuleLoadError(f"CSV line {line_number}: duplicate rule id {rule.id!r}.")
@@ -268,6 +297,8 @@ def load_rules_with_warnings(
         if not rules:
             raise RuleLoadError("CSV contains a header but no firewall rules.")
         return rules, warnings
+    except UnicodeDecodeError as exc:
+        raise RuleLoadError(f"CSV must be valid UTF-8 text: {exc}") from exc
     except OSError as exc:
         raise RuleLoadError(f"Could not read rule CSV: {exc}") from exc
     finally:

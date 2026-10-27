@@ -12,8 +12,8 @@ from typing import Callable
 import networkx as nx
 
 from core.checks import (
-    DEFAULT_TRUSTED_ZONES,
-    DEFAULT_UNTRUSTED_ZONES,
+    DEFAULT_ZONE_TRUST,
+    ZoneTrust,
     find_shadowing_rules,
 )
 from core.models import Rule
@@ -35,7 +35,7 @@ class PathSearchResult:
         return bool(self.path)
 
 
-def permit_risk(rule: Rule) -> int:
+def permit_risk(rule: Rule, zone_trust: ZoneTrust | None = None) -> int:
     """Give higher risk values to broad, unlogged, or trust-boundary permits."""
     if rule.action.value != "permit":
         raise ValueError(f"Rule {rule.id} is not a permit and cannot form an attack edge.")
@@ -48,17 +48,15 @@ def permit_risk(rule: Rule) -> int:
         risk += 10
     if not rule.log:
         risk += 2
-    if (
-        rule.src_zone.casefold() in DEFAULT_UNTRUSTED_ZONES
-        and rule.dst_zone.casefold() in DEFAULT_TRUSTED_ZONES
-    ):
+    trust = zone_trust or DEFAULT_ZONE_TRUST
+    if rule.src_zone.casefold() in trust.untrusted and rule.dst_zone.casefold() in trust.trusted:
         risk += 5
     return risk
 
 
-def risk_cost(rule: Rule) -> float:
+def risk_cost(rule: Rule, zone_trust: ZoneTrust | None = None) -> float:
     """Map permit risk to a positive cost; riskier rules cost less."""
-    return 10.0 / (1 + permit_risk(rule))
+    return 10.0 / (1 + permit_risk(rule, zone_trust))
 
 
 def rule_is_reachable(rule: Rule, earlier_rules: list[Rule]) -> bool:
@@ -69,6 +67,7 @@ def rule_is_reachable(rule: Rule, earlier_rules: list[Rule]) -> bool:
 def build_zone_graph(
     rules: list[Rule],
     respect_order: bool = True,
+    zone_trust: ZoneTrust | None = None,
 ) -> nx.MultiDiGraph:
     """Create a directed graph from permit rules reachable in policy order."""
     graph = nx.MultiDiGraph()
@@ -82,8 +81,8 @@ def build_zone_graph(
                 rule.dst_zone,
                 key=rule.id,
                 rule_id=rule.id,
-                cost=risk_cost(rule),
-                risk=permit_risk(rule),
+                cost=risk_cost(rule, zone_trust),
+                risk=permit_risk(rule, zone_trust),
             )
         earlier_rules.append(rule)
     return graph

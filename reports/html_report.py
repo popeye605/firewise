@@ -8,7 +8,7 @@ from typing import Sequence
 
 from ai.astar import PathSearchResult
 from ai.genetic import OptimizationResult
-from core.checks import Finding
+from core.checks import DEFAULT_ZONE_TRUST, Finding, ZoneTrust
 from core.models import Rule
 from core.score import HealthScore
 
@@ -96,6 +96,10 @@ def _optimizer_section(result: OptimizationResult | None) -> str:
         ("Candidate rejected", "Yes" if result.candidate_rejected else "No"),
         ("Fitness generations recorded", len(result.fitness_history)),
     ]
+    if result.packet_count_cap is not None:
+        rows.append(("Packet-count cap for large groups", result.packet_count_cap))
+        rows.append(("Search population cap", result.search_population_cap))
+        rows.append(("Search generation cap", result.search_generation_cap))
     table_rows = "".join(
         "<tr>" + _cell(label) + _cell(value) + "</tr>" for label, value in rows
     )
@@ -123,6 +127,17 @@ def _data_warnings_section(warnings: Sequence[str]) -> str:
     return "<ul>" + "".join(f"<li>{escape(warning)}</li>" for warning in warnings) + "</ul>"
 
 
+def _zone_trust_section(zone_trust: ZoneTrust) -> str:
+    """Render the active zone-trust classifications."""
+    return (
+        "<p><strong>Untrusted:</strong> "
+        + escape(", ".join(sorted(zone_trust.untrusted)) or "None")
+        + "<br><strong>Trusted:</strong> "
+        + escape(", ".join(sorted(zone_trust.trusted)) or "None")
+        + "</p>"
+    )
+
+
 def generate_html_report(
     *,
     source_name: str,
@@ -133,6 +148,7 @@ def generate_html_report(
     optimization_result: OptimizationResult | None = None,
     generated_at: datetime | None = None,
     data_warnings: Sequence[str] = (),
+    zone_trust: ZoneTrust | None = None,
 ) -> str:
     """Build a self-contained HTML report with escaped user-provided content."""
     timestamp = generated_at or datetime.now(timezone.utc)
@@ -151,6 +167,7 @@ def generate_html_report(
     safe_source = escape(source_name)
     finding_count = len(findings)
     rule_count = len(rules)
+    active_zone_trust = zone_trust or DEFAULT_ZONE_TRUST
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -189,6 +206,8 @@ th {{ background: #1e293b; }}
 </section>
 <h2>Findings by type</h2>
 <table><thead><tr><th>Problem</th><th>Count</th></tr></thead><tbody>{problem_rows}</tbody></table>
+<h2>Zone trust</h2>
+{_zone_trust_section(active_zone_trust)}
 <h2>Problem details and suggested fixes</h2>
 {_findings_table(findings)}
 <h2>Data warnings</h2>

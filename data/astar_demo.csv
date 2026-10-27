@@ -1,0 +1,5 @@
+id,src_zone,dst_zone,src_ip,dst_ip,service,action,log
+X1,Alpha,Delta,10.1.0.0/24,10.4.0.0/24,https,permit,yes
+X2,Alpha,Beta,any,any,any,permit,no
+X3,Beta,Gamma,any,any,any,permit,no
+X4,Gamma,Delta,any,any,any,permit,no

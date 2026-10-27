@@ -1,107 +1,107 @@
 # FireWise
 
-FireWise is an educational firewall-rule health checker. It uses sample or
-user-provided rule lists to explain common policy hygiene issues and recommend
-reviewable improvements. It is for defensive learning and does not apply
-firewall changes.
+FireWise is an educational, defensive firewall-rule auditing app. Upload a CSV
+policy to inspect common rule hygiene issues, compare zone paths, and produce a
+behavior-tested optimization recommendation.
 
-## CSV format
+![FireWise screenshot placeholder](docs/screenshot.png)
 
-The required CSV columns are `id`, `src_zone`, `dst_zone`, `src_ip`, `dst_ip`,
-`service`, `action`, and `log`. Addresses accept IPv4/IPv6 networks or `any`;
-multiple addresses can be separated with semicolons. Services accept `any`,
-`icmp`, `icmpv6`, bare `tcp` or `udp` (all ports), or `tcp/PORT[-END]` and
-`udp/PORT[-END]`. Named aliases include `http`, `https`, `ssh`, `dns`, `rdp`,
-`ntp`, `ftp`, `smtp`, `smtps`, `submission`, `imap`, `imaps`, `pop3`, `pop3s`,
-`mysql`, `postgres`, `mssql`, `ldap`, `ldaps`, `smb`, `telnet`, `snmp`, and
-`syslog`. Same-protocol service lists may use semicolons or pipes; quote
-comma-separated lists in CSV, for example `"tcp/80,443"`. A service list cannot
-mix protocols; use separate rule rows. Actions accept permit/allow/accept and
-deny/block/drop/reject. Logging must be explicitly enabled or disabled.
+## Install and run
 
-## Phase 1: models and loading
-
-Firewall rules are normalized into immutable, typed models. The loader validates
-the CSV header and every value. `load_rules_with_warnings()` reports when host
-bits were normalized, a `/0` network was written instead of `any`, or a rule ID
-was trimmed; `load_rules()` keeps its original rules-only return value.
-`load_demo_rules()` finds the bundled sample relative to the loader module rather
-than the current working directory.
-
-## Phases 2-3: findings and health score
-
-`analyze_rules()` reports Any-Any rules, rules shadowed by earlier rules (also
-when a sound union of same-service rules covers a target), duplicate
-match-and-action rules, unlogged permits, and permits from configured untrusted
-zones to trusted zones. Zone classifications use conventional defaults for the
-demo and should be customized for real networks.
-
-`calculate_health_score()` assigns 10, 5, and 2 points to high, medium, and low
-findings. Combined penalties are capped at 10 per affected rule, so overlapping
-findings cannot subtract more than the maximum risk assigned to one rule. The
-score is `round(100 * (1 - total_penalty / (rule_count * 10)))`, constrained to
-0-100. An empty rule list is rejected.
-
-## Phase 4: attack paths
-
-`build_zone_graph()` creates a directed NetworkX multigraph with one edge per
-reachable permit rule by default; permits fully covered by earlier rules are
-omitted. Set `respect_order=False` to include all permits. Denies do not create
-paths. Riskier allows have lower positive cost: the base risk is increased for
-Any-Any rules, unlogged permits, and default untrusted-to-trusted zone pairs,
-then mapped to `10 / (1 + risk)`.
-
-`astar_search()` implements A* directly. Its heuristic is the minimum edge cost
-times the fewest remaining zone hops, which is an admissible lower bound.
-`breadth_first_search()` independently implements BFS and returns a fewest-hop
-route; it does not minimize risk cost. Both results report the visited-node
-count. The conventional zone-name defaults should be adapted to each network.
-
-## Phase 5: genetic optimizer
-
-`optimize_rules()` evolves a chromosome of ordered rule IDs independently per
-source/destination zone pair. Tournament selection, membership-and-order
-crossover, remove/add/swap mutation, and elitism are implemented in Python.
-Fitness favors fewer rules and lower permit risk, with a 100,000-point penalty
-for every changed boundary-packet decision.
-
-The candidate is checked against deterministic network/port-boundary packets and
-exactly 1,000 seeded random packets by default. Comparisons use first-match
-allow/deny behavior and include implicit deny. If any tested decision changes,
-the candidate is rejected and the original policy is returned. The check is
-strong evidence, not a formal proof for every possible packet. Rules marked
-`not_analyzed` are refused by the optimizer rather than approximated.
-By default, logged deny rules are forced to stay in every recommendation; set
-`keep_deny_rules=True` to preserve all deny rules. Removed deny rules are
-reported because removing them also removes their logging.
-
-Optimized rules are recommendations only; FireWise never applies them.
-
-## Run on Windows
-
-From the project root, create a virtual environment, install the project
-dependencies, and start the Streamlit app:
+Use Python 3.11 or newer from the project root:
 
 ```powershell
-py -3 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[test]"
 .\.venv\Scripts\python.exe -m streamlit run app.py
 ```
 
-Open the URL printed by Streamlit (normally `http://localhost:8501`). To install
-the optional test dependency as well, use
-`.\.venv\Scripts\python.exe -m pip install -e ".[test]"`.
+Open the local URL printed by Streamlit, usually `http://localhost:8501`.
 
-## Phase 7: HTML report
+## CSV input
 
-The Report tab generates a standalone HTML download with the policy source,
-health score, findings by type, data warnings, each finding's explanation and
-suggested fix, any A*/BFS path comparison, and any optimizer verification
-recorded in the session. User-controlled values are HTML-escaped, and the report
-has no external assets or network dependencies.
+Policies are loaded from CSV with eight required columns. See the
+[CSV format guide](docs/CSV_FORMAT.md) for accepted networks, services,
+actions, logging values, examples, and common errors. A
+[vendor-style conversion template](scripts/convert_example.py) shows how to
+map a simple CSV export into FireWise format.
 
-Run tests from the project root:
+The app also includes three bundled samples: `demo_rules`, `astar_demo`, and
+`stress_rules`.
+
+## Features
+
+- Explainable findings for broad, duplicate, shadowed, unlogged, and
+  untrusted-to-trusted rules.
+- A customizable zone-trust editor and import/export JSON.
+- A network graph with first-match reachability filtering.
+- A* minimum-risk paths and BFS fewest-hop paths.
+- A genetic algorithm (GA) that recommends smaller ordered policies and
+  checks packet decisions before offering the result.
+- Downloadable CSV recommendations and self-contained HTML reports.
+
+Zone trust can be imported/exported as JSON; names are compared
+case-insensitively, and a zone cannot be both trusted and untrusted:
+
+```json
+{
+  "untrusted": ["internet", "guest"],
+  "trusted": ["database", "internal"]
+}
+```
+
+### How the analysis works
+
+- **A\*** uses positive permit-risk edge costs and an admissible hop-based
+  heuristic to find a lowest-cost zone route. **BFS** independently finds a
+  route with the fewest zone hops.
+- **GA** evolves ordered rule subsets independently for each source/destination
+  zone pair. It favors smaller, lower-risk candidates, while keeping configured
+  deny rules and checking that allow/deny decisions do not change for generated
+  boundary and seeded random packets.
+- **Constraint checks** compare normalized source and destination network
+  intervals and service port ranges. Shadow analysis reports full coverage,
+  including sound unions of earlier rules, and avoids combining independent
+  source/destination coverage into false positives.
+
+## Results on bundled demo data
+
+Measured with the default zone-trust settings, the demo policy has **40 rules,
+23 findings, and a health score of 74/100**. Moving `web` from trusted to neutral
+reduces trust-boundary findings and raises the score from the previous 70/100 to
+74/100. The baseline default classification
+includes Internet as untrusted and Database as trusted; the `web` zone is now
+neutral. Across all reachable zone pairs, the measured A*/BFS explored-node
+totals are 78/115. The fixed-seed optimizer recommended 30 rules from 40, lowered
+permit-risk points from 79 to 67, and compared 3,680 packets. The optimizer
+recommendation is review-only and is measured separately from the policy health
+score.
+
+Run `python experiments.py` to reproduce the measurements for all three CSV
+samples. The fixed-seed results are written to
+[`results/experiment_results.md`](results/experiment_results.md).
+
+## Limitations
+
+- CSV input only; FireWise does not connect to a firewall or apply changes.
+- NAT, schedules, FQDN objects, and other vendor-specific policy semantics are
+  not modeled.
+- Optimizer behavior verification is sampled, not a formal proof for every
+  possible packet.
+- For a zone-pair group larger than 200 rules, the optimizer caps packet
+  verification at 100 packets and its search at 8 candidates × 6 generations.
+- Default zone trust is name-based and may not match your network; configure it
+  for your environment before interpreting trust-boundary findings.
+- Uploads are limited to 5 MB and 5,000 firewall rules.
+
+## Security
+
+Use only sanitized data; uploads are processed locally. Do not upload secrets,
+credentials, or unredacted sensitive network details.
+
+Recommendations are for review only; FireWise never changes a real firewall.
+
+## Tests
 
 ```powershell
 python -m pytest -q

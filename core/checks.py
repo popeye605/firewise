@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from functools import lru_cache
+import json
+from pathlib import Path
 from typing import Iterable
 
 from core.models import IPAddressNetwork, PortRange, Rule, ServiceMatch
@@ -41,9 +44,80 @@ class Finding:
 
 DEFAULT_UNTRUSTED_ZONES = frozenset({"internet", "guest", "vendor", "untrusted"})
 DEFAULT_TRUSTED_ZONES = frozenset(
-    {"internal", "database", "management", "network", "storage", "artifact", "web", "services"}
+    {"internal", "database", "management", "network", "storage", "artifact", "services"}
 )
 _WILDCARD_NETWORKS = frozenset({"0.0.0.0/0", "::/0"})
+
+
+@dataclass(frozen=True, slots=True)
+class ZoneTrust:
+    """Case-insensitive trust classifications for network zones."""
+
+    untrusted: frozenset[str]
+    trusted: frozenset[str]
+
+    def __post_init__(self) -> None:
+        """Normalize names and reject conflicting trust classifications."""
+        untrusted = frozenset(zone.strip().casefold() for zone in self.untrusted)
+        trusted = frozenset(zone.strip().casefold() for zone in self.trusted)
+        overlap = untrusted & trusted
+        if overlap:
+            raise ValueError(
+                "Zones cannot be both untrusted and trusted: "
+                + ", ".join(sorted(overlap))
+            )
+        object.__setattr__(self, "untrusted", untrusted)
+        object.__setattr__(self, "trusted", trusted)
+
+
+DEFAULT_ZONE_TRUST = ZoneTrust(DEFAULT_UNTRUSTED_ZONES, DEFAULT_TRUSTED_ZONES)
+
+
+@lru_cache(maxsize=16_384)
+def _network_bounds(network: IPAddressNetwork) -> tuple[int, int, int]:
+    """Cache numeric inclusive network bounds for repeated coverage checks."""
+    return (
+        network.version,
+        int(network.network_address),
+        int(network.broadcast_address),
+    )
+
+
+def parse_zone_trust_json(content: str) -> ZoneTrust:
+    """Parse and validate a JSON zone trust mapping."""
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid zone trust JSON: {exc.msg} at line {exc.lineno}.") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Invalid zone trust JSON: expected an object.")
+    if set(payload) != {"untrusted", "trusted"}:
+        raise ValueError(
+            "Invalid zone trust JSON: expected exactly 'untrusted' and 'trusted' lists."
+        )
+    values: dict[str, frozenset[str]] = {}
+    for key in ("untrusted", "trusted"):
+        entries = payload[key]
+        if not isinstance(entries, list) or not all(
+            isinstance(entry, str) and entry.strip() for entry in entries
+        ):
+            raise ValueError(
+                f"Invalid zone trust JSON: '{key}' must be a list of non-empty strings."
+            )
+        values[key] = frozenset(entries)
+    try:
+        return ZoneTrust(untrusted=values["untrusted"], trusted=values["trusted"])
+    except ValueError as exc:
+        raise ValueError(f"Invalid zone trust JSON: {exc}") from exc
+
+
+def load_zone_trust(path: str | Path) -> ZoneTrust:
+    """Load zone trust classifications from a UTF-8 JSON file."""
+    try:
+        content = Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"Could not read zone trust file: {exc}") from exc
+    return parse_zone_trust_json(content)
 
 
 def _network_set_covers(
@@ -51,18 +125,23 @@ def _network_set_covers(
     covered: tuple[IPAddressNetwork, ...],
 ) -> bool:
     """Return whether a union of networks contains every target network."""
+    if len(covering) == 1:
+        return all(
+            target.version == covering[0].version and target.subnet_of(covering[0])
+            for target in covered
+        )
     for target in covered:
-        target_start = int(target.network_address)
-        target_end = int(target.broadcast_address)
+        _, target_start, target_end = _network_bounds(target)
         intervals = sorted(
             (
-                int(network.network_address),
-                int(network.broadcast_address),
+                start,
+                end,
             )
             for network in covering
-            if network.version == target.version
-            and int(network.network_address) <= target_end
-            and int(network.broadcast_address) >= target_start
+            for version, start, end in (_network_bounds(network),)
+            if version == target.version
+            and start <= target_end
+            and end >= target_start
         )
         next_address = target_start
         for start, end in intervals:
@@ -141,44 +220,41 @@ def find_shadowing_rules(
     if single_cover is not None:
         return (single_cover,)
 
-    by_destination: dict[tuple[IPAddressNetwork, ...], list[Rule]] = {}
-    by_source: dict[tuple[IPAddressNetwork, ...], list[Rule]] = {}
-    for previous in eligible:
-        if _network_set_covers(previous.dst_networks, rule.dst_networks):
-            by_destination.setdefault(previous.dst_networks, []).append(previous)
-        if _network_set_covers(previous.src_networks, rule.src_networks):
-            by_source.setdefault(previous.src_networks, []).append(previous)
-
     # Requiring a shared source or destination rectangle avoids inventing
     # cross-product pairs by independently unioning both address dimensions.
-    for group in by_destination.values():
-        covering_sources: list[IPAddressNetwork] = []
-        contributors: list[Rule] = []
-        for previous in group:
-            covering_sources.extend(previous.src_networks)
-            contributors.append(previous)
-            if _network_set_covers(tuple(covering_sources), rule.src_networks):
-                return tuple(contributors)
-    for group in by_source.values():
-        covering_destinations: list[IPAddressNetwork] = []
-        contributors = []
-        for previous in group:
-            covering_destinations.extend(previous.dst_networks)
-            contributors.append(previous)
-            if _network_set_covers(tuple(covering_destinations), rule.dst_networks):
-                return tuple(contributors)
+    same_destination = [
+        previous
+        for previous in eligible
+        if _network_set_covers(previous.dst_networks, rule.dst_networks)
+    ]
+    covering_sources = tuple(
+        network for previous in same_destination for network in previous.src_networks
+    )
+    if same_destination and _network_set_covers(covering_sources, rule.src_networks):
+        return tuple(same_destination)
+
+    same_source = [
+        previous
+        for previous in eligible
+        if _network_set_covers(previous.src_networks, rule.src_networks)
+    ]
+    covering_destinations = tuple(
+        network for previous in same_source for network in previous.dst_networks
+    )
+    if same_source and _network_set_covers(covering_destinations, rule.dst_networks):
+        return tuple(same_source)
     return ()
 
 
-def _same_match(first: Rule, second: Rule) -> bool:
-    """Compare match conditions and action, excluding identity and logging."""
+def _match_key(rule: Rule) -> tuple[object, ...]:
+    """Build a hashable key for duplicate rule matching."""
     return (
-        first.src_zone.casefold() == second.src_zone.casefold()
-        and first.dst_zone.casefold() == second.dst_zone.casefold()
-        and first.src_networks == second.src_networks
-        and first.dst_networks == second.dst_networks
-        and first.service == second.service
-        and first.action == second.action
+        rule.src_zone.casefold(),
+        rule.dst_zone.casefold(),
+        rule.src_networks,
+        rule.dst_networks,
+        rule.service,
+        rule.action,
     )
 
 
@@ -198,6 +274,7 @@ def _zone_names(zones: Iterable[str]) -> frozenset[str]:
 
 def analyze_rules(
     rules: Iterable[Rule],
+    zone_trust: ZoneTrust | None = None,
     *,
     untrusted_zones: Iterable[str] = DEFAULT_UNTRUSTED_ZONES,
     trusted_zones: Iterable[str] = DEFAULT_TRUSTED_ZONES,
@@ -210,9 +287,14 @@ def analyze_rules(
     customized for real environments.
     """
     ordered_rules = list(rules)
-    untrusted = _zone_names(untrusted_zones)
-    trusted = _zone_names(trusted_zones)
+    trust = zone_trust or ZoneTrust(
+        frozenset(untrusted_zones),
+        frozenset(trusted_zones),
+    )
+    untrusted = trust.untrusted
+    trusted = trust.trusted
     findings: list[Finding] = []
+    first_by_match: dict[tuple[object, ...], Rule] = {}
 
     for index, rule in enumerate(ordered_rules):
         if _is_any_any(rule):
@@ -270,12 +352,10 @@ def analyze_rules(
                 )
             )
 
-        prior_matches = [
-            previous
-            for previous in ordered_rules[:index]
-            if _same_match(previous, rule)
-        ]
-        if prior_matches:
+        match_key = _match_key(rule)
+        prior_match = first_by_match.get(match_key)
+        first_by_match.setdefault(match_key, rule)
+        if prior_match is not None:
             findings.append(
                 Finding(
                     rule_id=rule.id,
@@ -289,7 +369,7 @@ def analyze_rules(
                         "Review references and logging needs, then remove the "
                         "duplicate if it is not required for documentation."
                     ),
-                    related_rule_ids=(prior_matches[0].id,),
+                    related_rule_ids=(prior_match.id,),
                 )
             )
             continue

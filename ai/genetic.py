@@ -10,6 +10,7 @@ import random
 from typing import Callable, Sequence
 
 from ai.astar import permit_risk
+from core.checks import ZoneTrust
 from core.models import Action, IPAddressNetwork, Rule
 
 IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
@@ -18,6 +19,10 @@ Chromosome = tuple[str, ...]
 
 _ANY_PROTOCOLS = ("tcp", "udp", "icmp", "icmpv6")
 _COMMON_PORTS = (0, 1, 22, 53, 80, 123, 443, 3389, 65535)
+_LARGE_GROUP_RULE_LIMIT = 200
+_LARGE_POLICY_PACKET_CAP = 100
+_LARGE_POLICY_POPULATION_CAP = 8
+_LARGE_POLICY_GENERATION_CAP = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +74,9 @@ class OptimizationResult:
     candidate_rejected: bool
     optimized_zone_pairs: tuple[ZonePair, ...]
     removed_deny_rules: tuple[str, ...] = ()
+    packet_count_cap: int | None = None
+    search_population_cap: int | None = None
+    search_generation_cap: int | None = None
 
 
 def _address_samples(network: IPAddressNetwork) -> set[IPAddress]:
@@ -100,8 +108,25 @@ def _ports_for_rule(rule: Rule, protocol: str) -> tuple[int | None, ...]:
     return tuple(sorted(ports))
 
 
-def generate_boundary_packets(rules: Sequence[Rule]) -> tuple[Packet, ...]:
+def generate_boundary_packets(
+    rules: Sequence[Rule],
+    max_packets: int | None = None,
+) -> tuple[Packet, ...]:
     """Generate deterministic packets from each rule's address and service boundaries."""
+    if max_packets is not None and max_packets < 1:
+        raise ValueError("max_packets must be positive.")
+
+    def packet_key(packet: Packet) -> tuple[str, str, int, int, int, str, int]:
+        return (
+            packet.src_zone.casefold(),
+            packet.dst_zone.casefold(),
+            packet.src_ip.version,
+            int(packet.src_ip),
+            int(packet.dst_ip),
+            packet.protocol,
+            -1 if packet.dst_port is None else packet.dst_port,
+        )
+
     packets: set[Packet] = set()
     for rule in rules:
         protocols = (
@@ -129,20 +154,9 @@ def generate_boundary_packets(rules: Sequence[Rule]) -> tuple[Packet, ...]:
                                         dst_port=port,
                                     )
                                 )
-    return tuple(
-        sorted(
-            packets,
-            key=lambda packet: (
-                packet.src_zone.casefold(),
-                packet.dst_zone.casefold(),
-                packet.src_ip.version,
-                int(packet.src_ip),
-                int(packet.dst_ip),
-                packet.protocol,
-                -1 if packet.dst_port is None else packet.dst_port,
-            ),
-        )
-    )
+                                if max_packets is not None and len(packets) >= max_packets:
+                                    return tuple(sorted(packets, key=packet_key))
+    return tuple(sorted(packets, key=packet_key))
 
 
 def _random_address(network: IPAddressNetwork, rng: random.Random) -> IPAddress:
@@ -251,9 +265,16 @@ def _candidate_rules(chromosome: Chromosome, by_id: dict[str, Rule]) -> tuple[Ru
     return tuple(by_id[rule_id] for rule_id in chromosome)
 
 
-def _risk_score(rules: Sequence[Rule]) -> int:
+def _risk_score(
+    rules: Sequence[Rule],
+    zone_trust: ZoneTrust | None = None,
+) -> int:
     """Sum risk points for broad, unlogged, and trust-boundary permits."""
-    return sum(permit_risk(rule) for rule in rules if rule.action is Action.PERMIT)
+    return sum(
+        permit_risk(rule, zone_trust)
+        for rule in rules
+        if rule.action is Action.PERMIT
+    )
 
 
 def _decisions(rules: Sequence[Rule], packets: Sequence[Packet]) -> tuple[bool, ...]:
@@ -267,6 +288,7 @@ def verify_behavior_equivalence(
     *,
     random_packet_count: int = 1000,
     seed: int = 2026,
+    boundary_packet_limit: int | None = None,
 ) -> BehaviorVerification:
     """Compare allow/deny decisions on rule boundaries and seeded random packets."""
     if random_packet_count < 0:
@@ -278,7 +300,7 @@ def verify_behavior_equivalence(
     candidate_pairs = set(_group_rules(candidate_rules))
     if not candidate_pairs.issubset(original_groups):
         raise ValueError("Candidate contains a zone pair absent from the original policy.")
-    boundary_packets = generate_boundary_packets(original_rules)
+    boundary_packets = generate_boundary_packets(original_rules, boundary_packet_limit)
     boundary_count = len(boundary_packets)
     rng = random.Random(seed)
     if random_packet_count and not original_rules:
@@ -307,9 +329,12 @@ def verify_behavior_equivalence(
     )
 
 
-def _group_boundary_packets(group: Sequence[Rule]) -> tuple[Packet, ...]:
+def _group_boundary_packets(
+    group: Sequence[Rule],
+    max_packets: int | None = None,
+) -> tuple[Packet, ...]:
     """Create the fixed training corpus for one zone-pair chromosome."""
-    return generate_boundary_packets(group)
+    return generate_boundary_packets(group, max_packets)
 
 
 def _fitness(
@@ -317,6 +342,7 @@ def _fitness(
     original_decisions: tuple[bool, ...],
     packets: Sequence[Packet],
     by_id: dict[str, Rule],
+    zone_trust: ZoneTrust | None = None,
 ) -> float:
     """Maximize compactness and lower risk while heavily penalizing behavior changes."""
     candidate = _candidate_rules(chromosome, by_id)
@@ -326,7 +352,7 @@ def _fitness(
     )
     return (
         -10.0 * len(candidate)
-        - float(_risk_score(candidate))
+        - float(_risk_score(candidate, zone_trust))
         - 100_000.0 * mismatches
     )
 
@@ -421,12 +447,14 @@ def _optimize_group(
     mutation_rate: float,
     rng: random.Random,
     required_ids: frozenset[str] = frozenset(),
+    zone_trust: ZoneTrust | None = None,
+    max_boundary_packets: int | None = None,
     progress_callback: Callable[[float], None] | None = None,
 ) -> tuple[tuple[Rule, ...], tuple[float, ...]]:
     """Evolve one zone pair's keep/order chromosome."""
     all_ids = tuple(rule.id for rule in rules)
     by_id = {rule.id: rule for rule in rules}
-    packets = _group_boundary_packets(rules)
+    packets = _group_boundary_packets(rules, max_boundary_packets)
     original_decisions = _decisions(rules, packets)
     population: list[Chromosome] = [all_ids]
     while len(population) < population_size:
@@ -439,7 +467,7 @@ def _optimize_group(
         population.append(tuple(genes))
 
     fitnesses = [
-        _fitness(chromosome, original_decisions, packets, by_id)
+        _fitness(chromosome, original_decisions, packets, by_id, zone_trust)
         for chromosome in population
     ]
     history = [max(fitnesses)]
@@ -455,7 +483,7 @@ def _optimize_group(
             next_population.append(child)
         population = next_population
         fitnesses = [
-            _fitness(chromosome, original_decisions, packets, by_id)
+            _fitness(chromosome, original_decisions, packets, by_id, zone_trust)
             for chromosome in population
         ]
         history.append(max(fitnesses))
@@ -477,6 +505,7 @@ def optimize_rules(
     progress_callback: Callable[[float], None] | None = None,
     keep_deny_rules: bool = False,
     keep_logged_rules: bool = True,
+    zone_trust: ZoneTrust | None = None,
 ) -> OptimizationResult:
     """Recommend compact per-zone-pair rule lists and verify behavior.
 
@@ -493,6 +522,8 @@ def optimize_rules(
         raise ValueError("generations must be at least 1.")
     if not 0 <= mutation_rate <= 1:
         raise ValueError("mutation_rate must be between 0 and 1.")
+    if random_packet_count < 0:
+        raise ValueError("random_packet_count cannot be negative.")
     _validate_rules(rules)
 
     original = tuple(rules)
@@ -505,6 +536,17 @@ def optimize_rules(
     optimized_pairs: list[ZonePair] = []
     ordered_groups = sorted(groups.items(), key=lambda item: pair_indices[item[0]])
     group_count = len(ordered_groups)
+    large_group = any(
+        len(group) > _LARGE_GROUP_RULE_LIMIT for group in groups.values()
+    )
+    boundary_packet_limit = (
+        _LARGE_POLICY_PACKET_CAP // 2 if large_group else None
+    )
+    effective_random_packet_count = (
+        min(random_packet_count, _LARGE_POLICY_PACKET_CAP // 2)
+        if large_group
+        else random_packet_count
+    )
     for group_index, (pair, group) in enumerate(ordered_groups):
         if len(group) < 2:
             recommendations.append((pair, tuple(group)))
@@ -519,8 +561,16 @@ def optimize_rules(
 
         optimized_group, history = _optimize_group(
             group,
-            population_size=population_size,
-            generations=generations,
+            population_size=(
+                min(population_size, _LARGE_POLICY_POPULATION_CAP)
+                if len(group) > _LARGE_GROUP_RULE_LIMIT
+                else population_size
+            ),
+            generations=(
+                min(generations, _LARGE_POLICY_GENERATION_CAP)
+                if len(group) > _LARGE_GROUP_RULE_LIMIT
+                else generations
+            ),
             mutation_rate=mutation_rate,
             rng=group_rng,
             required_ids=frozenset(
@@ -528,6 +578,12 @@ def optimize_rules(
                 for rule in group
                 if rule.action is Action.DENY
                 and (keep_deny_rules or (keep_logged_rules and rule.log))
+            ),
+            zone_trust=zone_trust,
+            max_boundary_packets=(
+                boundary_packet_limit
+                if len(group) > _LARGE_GROUP_RULE_LIMIT
+                else None
             ),
             progress_callback=report_group_progress,
         )
@@ -554,8 +610,9 @@ def optimize_rules(
     verification = verify_behavior_equivalence(
         original,
         recommended,
-        random_packet_count=random_packet_count,
+        random_packet_count=effective_random_packet_count,
         seed=seed,
+        boundary_packet_limit=boundary_packet_limit,
     )
     candidate_rejected = not verification.equivalent
     if candidate_rejected:
@@ -563,8 +620,9 @@ def optimize_rules(
         verification = verify_behavior_equivalence(
             original,
             recommended,
-            random_packet_count=random_packet_count,
+            random_packet_count=effective_random_packet_count,
             seed=seed,
+            boundary_packet_limit=boundary_packet_limit,
         )
 
     before_count = len(original)
@@ -576,8 +634,8 @@ def optimize_rules(
         recommended_rules=recommended,
         before_rule_count=before_count,
         after_rule_count=after_count,
-        before_risk_score=_risk_score(original),
-        after_risk_score=_risk_score(recommended),
+        before_risk_score=_risk_score(original, zone_trust),
+        after_risk_score=_risk_score(recommended, zone_trust),
         reduction_percent=reduction,
         fitness_history=fitness_history,
         verification=verification,
@@ -588,5 +646,12 @@ def optimize_rules(
             for rule in original
             if rule.action is Action.DENY
             and rule.id not in recommended_ids
+        ),
+        packet_count_cap=_LARGE_POLICY_PACKET_CAP if large_group else None,
+        search_population_cap=(
+            _LARGE_POLICY_POPULATION_CAP if large_group else None
+        ),
+        search_generation_cap=(
+            _LARGE_POLICY_GENERATION_CAP if large_group else None
         ),
     )
