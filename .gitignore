@@ -10,7 +10,8 @@ venv/
 .vscode/
 .pytest_cache/
 *.egg-info/
-reports/
+reports/*.html
+reports/*.pdf
 
 # real data, never commit
 data/private/

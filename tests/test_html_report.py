@@ -103,3 +103,28 @@ def test_report_handles_clean_policy_and_missing_optional_results() -> None:
     assert "No findings were detected" in report
     assert "No attack-path search has been run" in report
     assert "No optimizer run has been recorded" in report
+
+
+def test_report_includes_escaped_data_warnings_and_removed_deny_warning() -> None:
+    from dataclasses import replace
+
+    rules = load_demo_rules()
+    result = optimize_rules(
+        rules,
+        population_size=8,
+        generations=3,
+        random_packet_count=20,
+    )
+    result = replace(result, removed_deny_rules=("R031",))
+    report = generate_html_report(
+        source_name="Demo",
+        rules=rules,
+        findings=analyze_rules(rules),
+        health_score=calculate_health_score(rules, analyze_rules(rules)),
+        optimization_result=result,
+        data_warnings=["CSV line 7: <untrusted> warning"],
+    )
+
+    assert "<h2>Data warnings</h2>" in report
+    assert "CSV line 7: &lt;untrusted&gt; warning" in report
+    assert "These deny rules were removed; their logging is lost: R031" in report

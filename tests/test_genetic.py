@@ -1,11 +1,14 @@
 """Tests for per-zone genetic optimization and packet-based verification."""
 
 import ipaddress
+import random
 
 import pytest
 
 from ai.genetic import (
     Packet,
+    _crossover,
+    _mutate,
     generate_boundary_packets,
     optimize_rules,
     verify_behavior_equivalence,
@@ -168,3 +171,70 @@ def test_optimizer_never_changes_behavior_when_candidate_is_rejected() -> None:
 
     assert result.verification.equivalent
     assert result.recommended_rules == result.original_rules or not result.candidate_rejected
+
+
+def test_required_rules_survive_crossover_mutation_and_optimization() -> None:
+    required = frozenset({"logged-deny"})
+    all_ids = ("allow", "logged-deny", "optional")
+    crossover = _crossover(
+        ("allow", "logged-deny"),
+        ("allow",),
+        all_ids,
+        random.Random(5),
+        required,
+    )
+    assert "logged-deny" in crossover
+    assert _mutate((), ("logged-deny",), random.Random(1), required) == (
+        "logged-deny",
+    )
+
+    chromosome = ("allow", "logged-deny", "optional")
+    for seed in range(20):
+        chromosome = _mutate(chromosome, all_ids, random.Random(seed), required)
+        assert "logged-deny" in chromosome
+
+    rules = [
+        make_rule("logged-deny", action=Action.DENY, log=True),
+        make_rule("copy-deny", action=Action.DENY, log=False),
+        make_rule("permit-copy"),
+    ]
+    result = optimize_rules(
+        rules,
+        population_size=8,
+        generations=5,
+        random_packet_count=20,
+    )
+
+    assert "logged-deny" in {rule.id for rule in result.recommended_rules}
+    assert result.verification.equivalent
+
+
+def test_keep_deny_rules_and_removed_deny_reporting() -> None:
+    rules = [
+        make_rule("deny-a", action=Action.DENY, log=False),
+        make_rule("deny-b", action=Action.DENY, log=False),
+    ]
+
+    kept = optimize_rules(
+        rules,
+        keep_deny_rules=True,
+        population_size=8,
+        generations=5,
+        random_packet_count=20,
+    )
+    removable = optimize_rules(
+        rules,
+        keep_logged_rules=False,
+        population_size=12,
+        generations=8,
+        random_packet_count=20,
+        seed=3,
+    )
+
+    assert {rule.id for rule in kept.recommended_rules} == {"deny-a", "deny-b"}
+    assert kept.removed_deny_rules == ()
+    assert removable.verification.equivalent
+    assert removable.removed_deny_rules
+    assert set(removable.removed_deny_rules).isdisjoint(
+        rule.id for rule in removable.recommended_rules
+    )

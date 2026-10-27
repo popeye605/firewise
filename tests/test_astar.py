@@ -10,6 +10,7 @@ from ai.astar import (
     build_zone_graph,
     permit_risk,
     risk_cost,
+    rule_is_reachable,
 )
 from core.loader import load_demo_rules
 from core.models import Action
@@ -26,6 +27,17 @@ def test_graph_contains_only_permit_rules_with_risk_costs() -> None:
     assert graph["Internet"]["Web"]["allow"]["rule_id"] == "allow"
     assert graph["Internet"]["Web"]["allow"]["cost"] == risk_cost(permit)
     assert risk_cost(permit) > 0
+
+
+def test_graph_omits_permit_fully_blocked_by_earlier_rule() -> None:
+    deny = make_rule("deny", action=Action.DENY)
+    permit = make_rule("permit")
+
+    graph = build_zone_graph([deny, permit])
+
+    assert not rule_is_reachable(permit, [deny])
+    assert graph.number_of_edges() == 0
+    assert build_zone_graph([deny, permit], respect_order=False).number_of_edges() == 1
 
 
 def test_riskier_permit_has_lower_cost() -> None:

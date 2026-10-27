@@ -11,7 +11,11 @@ from typing import Callable
 
 import networkx as nx
 
-from core.checks import DEFAULT_TRUSTED_ZONES, DEFAULT_UNTRUSTED_ZONES
+from core.checks import (
+    DEFAULT_TRUSTED_ZONES,
+    DEFAULT_UNTRUSTED_ZONES,
+    find_shadowing_rules,
+)
 from core.models import Rule
 
 
@@ -57,20 +61,31 @@ def risk_cost(rule: Rule) -> float:
     return 10.0 / (1 + permit_risk(rule))
 
 
-def build_zone_graph(rules: list[Rule]) -> nx.MultiDiGraph:
-    """Create a directed, parallel-edge graph from permit rules."""
+def rule_is_reachable(rule: Rule, earlier_rules: list[Rule]) -> bool:
+    """Return whether any traffic matching a rule can reach it in order."""
+    return not find_shadowing_rules(rule, earlier_rules)
+
+
+def build_zone_graph(
+    rules: list[Rule],
+    respect_order: bool = True,
+) -> nx.MultiDiGraph:
+    """Create a directed graph from permit rules reachable in policy order."""
     graph = nx.MultiDiGraph()
+    earlier_rules: list[Rule] = []
     for rule in rules:
-        if rule.action.value != "permit":
-            continue
-        graph.add_edge(
-            rule.src_zone,
-            rule.dst_zone,
-            key=rule.id,
-            rule_id=rule.id,
-            cost=risk_cost(rule),
-            risk=permit_risk(rule),
-        )
+        if rule.action.value == "permit" and (
+            not respect_order or rule_is_reachable(rule, earlier_rules)
+        ):
+            graph.add_edge(
+                rule.src_zone,
+                rule.dst_zone,
+                key=rule.id,
+                rule_id=rule.id,
+                cost=risk_cost(rule),
+                risk=permit_risk(rule),
+            )
+        earlier_rules.append(rule)
     return graph
 
 
@@ -220,4 +235,3 @@ def _reconstruct_path(
         path.append(parent[path[-1]])
     path.reverse()
     return tuple(path)
-

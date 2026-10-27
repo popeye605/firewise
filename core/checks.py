@@ -120,6 +120,56 @@ def _rule_covers(covering: Rule, covered: Rule) -> bool:
     )
 
 
+def find_shadowing_rules(
+    rule: Rule,
+    earlier_rules: Iterable[Rule],
+) -> tuple[Rule, ...]:
+    """Return earlier rules that soundly cover the rule's full match space."""
+    eligible = [
+        previous
+        for previous in earlier_rules
+        if (
+            previous.src_zone.casefold() == rule.src_zone.casefold()
+            and previous.dst_zone.casefold() == rule.dst_zone.casefold()
+            and _service_covers(previous.service, rule.service)
+        )
+    ]
+    single_cover = next(
+        (previous for previous in eligible if _rule_covers(previous, rule)),
+        None,
+    )
+    if single_cover is not None:
+        return (single_cover,)
+
+    by_destination: dict[tuple[IPAddressNetwork, ...], list[Rule]] = {}
+    by_source: dict[tuple[IPAddressNetwork, ...], list[Rule]] = {}
+    for previous in eligible:
+        if _network_set_covers(previous.dst_networks, rule.dst_networks):
+            by_destination.setdefault(previous.dst_networks, []).append(previous)
+        if _network_set_covers(previous.src_networks, rule.src_networks):
+            by_source.setdefault(previous.src_networks, []).append(previous)
+
+    # Requiring a shared source or destination rectangle avoids inventing
+    # cross-product pairs by independently unioning both address dimensions.
+    for group in by_destination.values():
+        covering_sources: list[IPAddressNetwork] = []
+        contributors: list[Rule] = []
+        for previous in group:
+            covering_sources.extend(previous.src_networks)
+            contributors.append(previous)
+            if _network_set_covers(tuple(covering_sources), rule.src_networks):
+                return tuple(contributors)
+    for group in by_source.values():
+        covering_destinations: list[IPAddressNetwork] = []
+        contributors = []
+        for previous in group:
+            covering_destinations.extend(previous.dst_networks)
+            contributors.append(previous)
+            if _network_set_covers(tuple(covering_destinations), rule.dst_networks):
+                return tuple(contributors)
+    return ()
+
+
 def _same_match(first: Rule, second: Rule) -> bool:
     """Compare match conditions and action, excluding identity and logging."""
     return (
@@ -154,10 +204,10 @@ def analyze_rules(
 ) -> list[Finding]:
     """Find risky and redundant rules in their original first-match order.
 
-    Shadowing is reported when one earlier rule, on the same zone pair,
-    completely covers a later rule's addresses and service. Zone classification
-    uses the supplied sets; the defaults are conventional demo names and should
-    be customized for real environments.
+    Shadowing is reported when earlier rules on the same zone pair completely
+    cover a later rule's addresses and service. Zone classification uses the
+    supplied sets; the defaults are conventional demo names and should be
+    customized for real environments.
     """
     ordered_rules = list(rules)
     untrusted = _zone_names(untrusted_zones)
@@ -244,29 +294,30 @@ def analyze_rules(
             )
             continue
 
-        covering_rule = next(
-            (
-                previous
-                for previous in ordered_rules[:index]
-                if _rule_covers(previous, rule)
-            ),
-            None,
-        )
-        if covering_rule is not None:
+        covering_rules = find_shadowing_rules(rule, ordered_rules[:index])
+        if covering_rules:
+            related_rule_ids = tuple(previous.id for previous in covering_rules)
+            if len(covering_rules) == 1:
+                explanation = (
+                    f"Earlier rule {related_rule_ids[0]} matches all traffic "
+                    "covered by this rule, so this rule is never reached."
+                )
+            else:
+                explanation = (
+                    f"Rule {rule.id} is shadowed by earlier rules "
+                    f"{', '.join(related_rule_ids)} together."
+                )
             findings.append(
                 Finding(
                     rule_id=rule.id,
                     problem_type=ProblemType.SHADOWED,
                     severity=Severity.MEDIUM,
-                    explanation=(
-                        f"Earlier rule {covering_rule.id} matches all traffic "
-                        "covered by this rule, so this rule is never reached."
-                    ),
+                    explanation=explanation,
                     suggested_fix=(
                         "Review the earlier rule and intended policy; remove the "
                         "unreachable rule or narrow/reorder rules with care."
                     ),
-                    related_rule_ids=(covering_rule.id,),
+                    related_rule_ids=related_rule_ids,
                 )
             )
     return findings

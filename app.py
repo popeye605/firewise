@@ -21,7 +21,7 @@ from ai.astar import (
 )
 from ai.genetic import OptimizationResult, optimize_rules
 from core.checks import Finding, ProblemType, Severity, analyze_rules
-from core.loader import RuleLoadError, load_demo_rules, load_rules
+from core.loader import RuleLoadError, load_demo_rules, load_rules_with_warnings
 from core.models import Rule
 from core.score import calculate_health_score
 from reports.html_report import generate_html_report
@@ -41,11 +41,16 @@ def _invalidate_results() -> None:
     st.session_state["attack_path"] = None
 
 
-def _set_rules(rules: list[Rule], source_name: str) -> None:
+def _set_rules(
+    rules: list[Rule],
+    source_name: str,
+    data_warnings: list[str] | None = None,
+) -> None:
     """Store a new policy and invalidate results derived from the old one."""
     st.session_state["rules"] = rules
     st.session_state["source_name"] = source_name
     st.session_state["load_error"] = None
+    st.session_state["data_warnings"] = data_warnings or []
     _invalidate_results()
 
 
@@ -87,9 +92,10 @@ def _rule_csv(rules: tuple[Rule, ...]) -> str:
 def _render_zone_graph(
     rules: list[Rule],
     path_result: PathSearchResult | None,
+    respect_order: bool = True,
 ) -> None:
     """Display the directed permit graph and highlight any selected route."""
-    graph = build_zone_graph(rules)
+    graph = build_zone_graph(rules, respect_order=respect_order)
     if graph.number_of_nodes() == 0:
         st.info("There are no permit rules to show as zone transitions.")
         return
@@ -163,8 +169,8 @@ def _render_home() -> None:
             if st.session_state.get("upload_signature") != upload_signature:
                 try:
                     text = content.decode("utf-8-sig")
-                    parsed_rules = load_rules(StringIO(text))
-                    _set_rules(parsed_rules, uploaded_file.name)
+                    parsed_rules, warnings = load_rules_with_warnings(StringIO(text))
+                    _set_rules(parsed_rules, uploaded_file.name, warnings)
                     st.session_state["upload_signature"] = upload_signature
                     st.rerun()
                 except (UnicodeDecodeError, RuleLoadError) as exc:
@@ -178,6 +184,10 @@ def _render_home() -> None:
             f"Active policy: {st.session_state['source_name']} "
             f"({len(st.session_state['rules'])} rules). Open the other tabs to explore it."
         )
+        if st.session_state.get("data_warnings"):
+            with st.expander("Data warnings"):
+                for warning in st.session_state["data_warnings"]:
+                    st.warning(warning)
     else:
         st.info("Load the demo policy or upload a CSV to begin.")
 
@@ -299,14 +309,21 @@ def _render_problems(findings: list[Finding]) -> None:
 def _render_network_map(rules: list[Rule]) -> None:
     """Render zone selection, attack-path comparison, and interactive graph."""
     st.header("Network map and attack path")
-    graph = build_zone_graph(rules)
+    respect_order = st.checkbox(
+        "Ignore rules that never fire (recommended)",
+        value=True,
+        key="respect_rule_order",
+    )
+    graph = build_zone_graph(rules, respect_order=respect_order)
+    excluded_permits = sum(rule.action.value == "permit" for rule in rules) - graph.number_of_edges()
+    st.caption(f"Permit rules left out of the graph: {excluded_permits}")
     zones = sorted(graph.nodes, key=str.casefold)
     if not zones:
         st.info("No permit edges are available to build the zone map.")
         return
     if len(zones) == 1:
         st.info("Add permit rules connecting at least two zones to find an attack path.")
-        _render_zone_graph(rules, None)
+        _render_zone_graph(rules, None, respect_order)
         return
 
     source_default = zones.index("Internet") if "Internet" in zones else 0
@@ -328,13 +345,13 @@ def _render_network_map(rules: list[Rule]) -> None:
                 astar_search(graph, source, target),
                 breadth_first_search(graph, source, target),
             )
-            st.session_state["attack_request"] = (source, target)
+            st.session_state["attack_request"] = (source, target, respect_order)
         except ValueError as exc:
             st.error(f"Path search failed: {exc}")
             st.session_state["attack_results"] = None
 
     results = st.session_state.get("attack_results")
-    if st.session_state.get("attack_request") != (source, target):
+    if st.session_state.get("attack_request") != (source, target, respect_order):
         results = None
     selected_result: PathSearchResult | None = None
     if results:
@@ -367,7 +384,7 @@ def _render_network_map(rules: list[Rule]) -> None:
             width="stretch",
             hide_index=True,
         )
-    _render_zone_graph(rules, selected_result)
+    _render_zone_graph(rules, selected_result, respect_order)
 
 
 def _render_optimizer(rules: list[Rule]) -> None:
@@ -377,11 +394,23 @@ def _render_optimizer(rules: list[Rule]) -> None:
         "The optimizer recommends a rule list only. It never applies changes "
         "to a firewall; review exported rules before use."
     )
+    keep_logged_rules = st.checkbox(
+        "Keep logged deny rules",
+        value=True,
+        key="keep_logged_deny_rules",
+    )
+    keep_deny_rules = st.checkbox(
+        "Keep all deny rules",
+        value=False,
+        key="keep_all_deny_rules",
+    )
     if st.button("Run Optimizer", type="primary"):
         progress_bar = st.progress(0.0, text="Starting per-zone-pair optimization…")
         try:
             result = optimize_rules(
                 rules,
+                keep_logged_rules=keep_logged_rules,
+                keep_deny_rules=keep_deny_rules,
                 progress_callback=lambda progress: progress_bar.progress(
                     min(progress, 1.0),
                     text=f"Optimizing zone pairs: {progress:.0%}",
@@ -408,6 +437,11 @@ def _render_optimizer(rules: list[Rule]) -> None:
         st.success(
             "No allow/deny differences were found in the tested packet set. "
             "This is not a formal proof for all possible packets."
+        )
+    if result.removed_deny_rules:
+        st.warning(
+            "These deny rules were removed; their logging is lost: "
+            + ", ".join(result.removed_deny_rules)
         )
     comparison = pd.DataFrame(
         [
@@ -500,6 +534,7 @@ def _render_report(
             health_score=calculate_health_score(rules, findings),
             attack_results=st.session_state.get("attack_results"),
             optimization_result=st.session_state.get("optimization_result"),
+            data_warnings=st.session_state.get("data_warnings", []),
         )
     except (TypeError, ValueError) as exc:
         st.error(f"Could not generate the HTML report: {exc}")
@@ -534,6 +569,7 @@ def main() -> None:
     st.session_state.setdefault("attack_path", None)
     st.session_state.setdefault("upload_signature", None)
     st.session_state.setdefault("load_error", None)
+    st.session_state.setdefault("data_warnings", [])
 
     rules: list[Rule] = st.session_state["rules"]
     findings = analyze_rules(rules) if rules else []

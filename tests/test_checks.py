@@ -113,12 +113,69 @@ def test_union_of_networks_and_port_ranges_can_cover_a_rule() -> None:
         ports=(PortRange(400, 500),),
     )
 
-    # Neither prior rule alone covers the target; these must not be combined
-    # to claim that a single earlier rule fully shadows it.
+    # Neither prior rule's service covers the full target service.
     findings = analyze_rules([first, second, target])
     assert not any(
         item.rule_id == "target" and item.problem_type is ProblemType.SHADOWED
         for item in findings
+    )
+
+
+def test_union_of_same_service_source_networks_shadows_target() -> None:
+    first = make_rule("first", src_ip="10.0.0.0/25")
+    second = make_rule("second", src_ip="10.0.0.128/25")
+    target = make_rule("target", src_ip="10.0.0.0/24")
+
+    shadow = next(
+        finding
+        for finding in analyze_rules([first, second, target])
+        if finding.rule_id == "target"
+        and finding.problem_type is ProblemType.SHADOWED
+    )
+
+    assert shadow.related_rule_ids == ("first", "second")
+    assert shadow.explanation == "Rule target is shadowed by earlier rules first, second together."
+
+
+def test_source_union_does_not_shadow_when_service_differs() -> None:
+    first = make_rule(
+        "first",
+        src_ip="10.0.0.0/25",
+        ports=(PortRange(80, 80),),
+    )
+    second = make_rule(
+        "second",
+        src_ip="10.0.0.128/25",
+        ports=(PortRange(443, 443),),
+    )
+    target = make_rule("target", src_ip="10.0.0.0/24")
+
+    assert not any(
+        finding.rule_id == "target" and finding.problem_type is ProblemType.SHADOWED
+        for finding in analyze_rules([first, second, target])
+    )
+
+
+def test_independent_source_and_destination_unions_do_not_create_false_shadow() -> None:
+    first = make_rule(
+        "first",
+        src_ip="10.0.0.0/25",
+        dst_ip="192.0.2.0/24",
+    )
+    second = make_rule(
+        "second",
+        src_ip="10.0.0.128/25",
+        dst_ip="192.0.2.0/25",
+    )
+    target = make_rule(
+        "target",
+        src_ip="10.0.0.0/24",
+        dst_ip="192.0.2.0/24",
+    )
+
+    assert not any(
+        finding.rule_id == "target" and finding.problem_type is ProblemType.SHADOWED
+        for finding in analyze_rules([first, second, target])
     )
 
 

@@ -68,6 +68,7 @@ class OptimizationResult:
     verification: BehaviorVerification
     candidate_rejected: bool
     optimized_zone_pairs: tuple[ZonePair, ...]
+    removed_deny_rules: tuple[str, ...] = ()
 
 
 def _address_samples(network: IPAddressNetwork) -> set[IPAddress]:
@@ -346,6 +347,7 @@ def _crossover(
     second: Chromosome,
     all_ids: tuple[str, ...],
     rng: random.Random,
+    required_ids: frozenset[str] = frozenset(),
 ) -> Chromosome:
     """Combine parent membership choices and inherit order from both parents."""
     first_set = set(first)
@@ -363,10 +365,12 @@ def _crossover(
             and rng.random() < 0.5
         )
     }
+    selected.update(required_ids)
     order_sources = (first, second) if rng.random() < 0.5 else (second, first)
     child: list[str] = []
     for parent in order_sources:
         child.extend(rule_id for rule_id in parent if rule_id in selected and rule_id not in child)
+    child.extend(rule_id for rule_id in all_ids if rule_id in selected and rule_id not in child)
     return tuple(child)
 
 
@@ -374,21 +378,31 @@ def _mutate(
     chromosome: Chromosome,
     all_ids: tuple[str, ...],
     rng: random.Random,
+    required_ids: frozenset[str] = frozenset(),
 ) -> Chromosome:
     """Remove, restore, or swap a rule to explore the search space."""
     genes = list(chromosome)
+    genes.extend(
+        rule_id
+        for rule_id in all_ids
+        if rule_id in required_ids and rule_id not in genes
+    )
     operations = ["remove", "add", "swap"]
-    if not genes:
+    removable_indices = [
+        index for index, rule_id in enumerate(genes) if rule_id not in required_ids
+    ]
+    if not removable_indices:
         operations.remove("remove")
+    if len(genes) < 2:
         operations.remove("swap")
     if len(genes) == len(all_ids):
         operations.remove("add")
     if not operations:
-        return chromosome
+        return tuple(genes)
 
     operation = rng.choice(operations)
     if operation == "remove":
-        genes.pop(rng.randrange(len(genes)))
+        genes.pop(rng.choice(removable_indices))
     elif operation == "add":
         missing = [rule_id for rule_id in all_ids if rule_id not in genes]
         if missing:
@@ -406,6 +420,7 @@ def _optimize_group(
     generations: int,
     mutation_rate: float,
     rng: random.Random,
+    required_ids: frozenset[str] = frozenset(),
     progress_callback: Callable[[float], None] | None = None,
 ) -> tuple[tuple[Rule, ...], tuple[float, ...]]:
     """Evolve one zone pair's keep/order chromosome."""
@@ -415,7 +430,11 @@ def _optimize_group(
     original_decisions = _decisions(rules, packets)
     population: list[Chromosome] = [all_ids]
     while len(population) < population_size:
-        genes = [rule_id for rule_id in all_ids if rng.random() < rng.uniform(0.5, 1.0)]
+        genes = [
+            rule_id
+            for rule_id in all_ids
+            if rule_id in required_ids or rng.random() < rng.uniform(0.5, 1.0)
+        ]
         rng.shuffle(genes)
         population.append(tuple(genes))
 
@@ -430,9 +449,9 @@ def _optimize_group(
         while len(next_population) < population_size:
             parent_a = _select(population, fitnesses, rng)
             parent_b = _select(population, fitnesses, rng)
-            child = _crossover(parent_a, parent_b, all_ids, rng)
+            child = _crossover(parent_a, parent_b, all_ids, rng, required_ids)
             if rng.random() < mutation_rate:
-                child = _mutate(child, all_ids, rng)
+                child = _mutate(child, all_ids, rng, required_ids)
             next_population.append(child)
         population = next_population
         fitnesses = [
@@ -456,6 +475,8 @@ def optimize_rules(
     random_packet_count: int = 1000,
     seed: int = 2026,
     progress_callback: Callable[[float], None] | None = None,
+    keep_deny_rules: bool = False,
+    keep_logged_rules: bool = True,
 ) -> OptimizationResult:
     """Recommend compact per-zone-pair rule lists and verify behavior.
 
@@ -502,6 +523,12 @@ def optimize_rules(
             generations=generations,
             mutation_rate=mutation_rate,
             rng=group_rng,
+            required_ids=frozenset(
+                rule.id
+                for rule in group
+                if rule.action is Action.DENY
+                and (keep_deny_rules or (keep_logged_rules and rule.log))
+            ),
             progress_callback=report_group_progress,
         )
         recommendations.append((pair, optimized_group))
@@ -542,6 +569,7 @@ def optimize_rules(
 
     before_count = len(original)
     after_count = len(recommended)
+    recommended_ids = {rule.id for rule in recommended}
     reduction = 100.0 * (before_count - after_count) / before_count
     return OptimizationResult(
         original_rules=original,
@@ -555,4 +583,10 @@ def optimize_rules(
         verification=verification,
         candidate_rejected=candidate_rejected,
         optimized_zone_pairs=tuple(optimized_pairs),
+        removed_deny_rules=tuple(
+            rule.id
+            for rule in original
+            if rule.action is Action.DENY
+            and rule.id not in recommended_ids
+        ),
     )
